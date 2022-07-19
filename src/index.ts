@@ -353,6 +353,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const hexString = bytesToWriteInput.value;
     if (hexString.length % 2 !== 0) {
       console.warn('Must have an even number of hex digits');
+      return;
     }
     const numBytes = hexString.length / 2;
     const byteArray = new Uint8Array(numBytes);
