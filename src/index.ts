@@ -54,9 +54,30 @@ let flowControlCheckbox: HTMLInputElement;
 let echoCheckbox: HTMLInputElement;
 let flushOnEnterCheckbox: HTMLInputElement;
 
+let startStreaming = false;
+let chipId: number;
 let portCounter = 1;
 let port: SerialPort | SerialPortPolyfill | undefined;
 let reader: ReadableStreamDefaultReader | undefined;
+
+let firmwareIdentifier: number;
+let firmwareMajor: number;
+let firmwareMinor: number;
+let firmwareInternal: number;
+let hardwareVersion: number;
+
+let promise: Promise<void>;
+
+const GET_FIRMWARE_VERSION_COMMAND = ConvertHexStringToByteArray('2E');
+const GET_SHIMMER_VERSION_COMMAND = ConvertHexStringToByteArray('3F');
+const START_STREAMING_COMMAND = ConvertHexStringToByteArray('07');
+const STOP_STREAMING_COMMAND = ConvertHexStringToByteArray('20');
+const GET_EXG_REG1_COMMAND = ConvertHexStringToByteArray('6300000A');
+const GET_EXG_REG2_COMMAND = ConvertHexStringToByteArray('6301000A');
+const SET_EXG_REG1_COMMAND = ConvertHexStringToByteArray('6100000A');
+const SET_EXG_REG2_COMMAND = ConvertHexStringToByteArray('6100010A');
+const SHIMMER3_DEFAULT_TEST_REG1 = new Uint8Array([0, 163, 16, 69, 69, 0, 0, 0, 2, 1]);
+const SHIMMER3_DEFAULT_TEST_REG2 = new Uint8Array([0, 163, 16, 69, 69, 0, 0, 0, 2, 1]);
 
 const urlParams = new URLSearchParams(window.location.search);
 const usePolyfill = urlParams.has('polyfill');
@@ -257,6 +278,71 @@ async function connectToPort(): Promise<void> {
   try {
     await port.open(options);
     term.writeln('<CONNECTED>');
+
+    if (port?.writable == null) {
+      console.warn(`unable to find writable port`);
+      return;
+    }
+
+    const writer = port.writable.getWriter();
+    let waitTime = 200;
+    await setTimeout(function() {
+      writer.write(GET_FIRMWARE_VERSION_COMMAND);
+    }, waitTime += 200);
+    await setTimeout(function() {
+      writer.write(GET_SHIMMER_VERSION_COMMAND);
+    }, waitTime += 200);
+
+    await setTimeout(function() {
+      if (firmwareIdentifier != 3 || hardwareVersion != 3){
+        return;
+      }
+      for (let i = 0; i < SET_EXG_REG1_COMMAND.length; i++){
+        writer.write(SET_EXG_REG1_COMMAND.subarray(i, i + 1));
+      }
+      for (let i = 0; i < SHIMMER3_DEFAULT_TEST_REG1.length; i++){
+        writer.write(SHIMMER3_DEFAULT_TEST_REG1.subarray(i, i + 1));
+      }
+    }, waitTime += 200);
+
+    setTimeout(function() {
+      if (firmwareIdentifier != 3 || hardwareVersion != 3){
+        return;
+      }
+      for (let i = 0; i < SET_EXG_REG2_COMMAND.length; i++){
+        writer.write(SET_EXG_REG2_COMMAND.subarray(i, i + 1));
+      }
+      for (let i = 0; i < SHIMMER3_DEFAULT_TEST_REG2.length; i++){
+        writer.write(SHIMMER3_DEFAULT_TEST_REG2.subarray(i, i + 1));
+      }
+    }, waitTime += 200);
+
+    setTimeout(function() {
+      if (firmwareIdentifier != 3 || hardwareVersion != 3){
+        return;
+      }
+      chipId = 1;
+      writer.write(GET_EXG_REG1_COMMAND);
+    }, waitTime += 200);
+
+    setTimeout(function() {
+      if (firmwareIdentifier != 3 || hardwareVersion != 3){
+        return;
+      }
+      chipId = 2;
+      writer.write(GET_EXG_REG2_COMMAND);
+      term.writeln('start streaming after 5 seconds');
+    }, waitTime += 200);
+
+    setTimeout(function() {
+      startStreaming = true;
+      writer.write(START_STREAMING_COMMAND);
+    }, waitTime += 5000);
+
+    setTimeout(function() {
+      writer.releaseLock();
+    }, waitTime += 200);
+
     connectButton.textContent = 'Disconnect';
     connectButton.disabled = false;
   } catch (e) {
@@ -269,12 +355,68 @@ async function connectToPort(): Promise<void> {
   while (port && port.readable) {
     try {
       reader = port.readable.getReader();
+      let temp: Uint8Array;
+      const dataTypes = ['u24','u8','i24r','i24r','u8','i24r','i24r'];
       for (;;) {
         const {value, done} = await reader.read();
         if (value) {
           await new Promise<void>((resolve) => {
-            term.write(value, resolve);
-            term.write(JSON.stringify(value));
+            //Because the byte array received is not always complete
+            console.log(value);
+            resolve();
+            //term.write('new bytes received ');
+            //term.write(Array.apply([], value).join(' '), resolve);
+            //term.writeln('');
+            if(value[0] == 255 && startStreaming){
+              term.writeln('Ack Received');
+              if(startStreaming){
+                term.writeln('Start Streaming');
+              }
+            }
+            if(value[0] == 255 || value[0] == 0){
+                temp = new Uint8Array([...value]);
+            }
+            else{
+              let temp2 = new Uint8Array(temp.length + value.length);
+              temp2.set(temp);
+              temp2.set(value, temp.length);
+              temp = temp2;
+            }
+            if(temp[0] == 0 && temp.length == 18 && startStreaming){
+              let parsedData: Array<number> = ParseData(temp.subarray(1), dataTypes);
+              term.writeln(String(parsedData));
+            }
+            if(temp[1] == 47 && temp.length == 8){
+              for(let i = 2; i < 8; i++){
+                firmwareIdentifier = (temp[i++] & 0xFF) + ((temp[i++] & 0xFF) << 8);
+                firmwareMajor = (temp[i++] & 0xFF) + ((temp[i++] & 0xFF) << 8);
+                firmwareMinor = temp[i++];
+                firmwareInternal = temp[i++];
+
+                term.writeln('FW VERSION RESPONSE Received');
+                term.writeln('Firmware identifier: ' + firmwareIdentifier);
+                term.writeln('Firmware major: ' + firmwareMajor);
+                term.writeln('Firmware minor: ' + firmwareMinor);
+                term.writeln('Firmware internal: ' + firmwareInternal);
+              }
+            }
+            else if(temp[1] == 37 && temp.length == 3){
+              hardwareVersion = temp[2];
+              term.writeln('Hardware version: ' + hardwareVersion);
+            }
+            else if(temp[1] == 98 && temp.length == 13)
+            {
+              if(chipId == 1){
+                term.writeln('EXG CHIP 1 CONFIGURATION');
+              }
+              else{
+                term.writeln('EXG CHIP 2 CONFIGURATION');
+              }
+              for(let i = 3; i < temp.length; i++){
+                term.write(String(temp[i]) + ' ');
+              }
+              term.writeln('');
+            }
           });
         }
         if (done) {
@@ -350,15 +492,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   writeButton.addEventListener('click', () => {
     bytesToWriteInput =
     document.getElementById('bytesToWrite') as HTMLInputElement;
-    const hexString = bytesToWriteInput.value;
-    if (hexString.length % 2 !== 0) {
-      console.warn('Must have an even number of hex digits');
+    const byteArray = ConvertHexStringToByteArray(bytesToWriteInput.value);
+    if (byteArray == null){
+      console.warn('input not valid');
       return;
-    }
-    const numBytes = hexString.length / 2;
-    const byteArray = new Uint8Array(numBytes);
-    for (let i=0; i<numBytes; i++) {
-      byteArray[i] = parseInt(hexString.substr(i*2, 2), 16);
     }
     if (port?.writable == null) {
       console.warn(`unable to find writable port`);
@@ -414,3 +551,40 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 });
+
+function ConvertHexStringToByteArray(hexString:string) {
+  if(hexString.length == 0){
+    throw new Error('hex string cannot be empty');
+  }
+  if (hexString.length % 2 !== 0) {
+    throw new Error('Must have an even number of hex digits');
+  }
+  const numBytes = hexString.length / 2;
+  const byteArray = new Uint8Array(numBytes);
+  for (let i=0; i<numBytes; i++) {
+    byteArray[i] = parseInt(hexString.substr(i*2, 2), 16);
+  }
+  return byteArray;
+}
+
+function ParseData(data:Uint8Array, dataTypes:Array<string>) {
+  const parsedData: Array<number> = [];
+  let j = 0;
+  for (let i=0; i<dataTypes.length; i++) {
+    if(dataTypes[i] === 'u8'){
+      parsedData.push(data[j++]);
+    }
+    else if(dataTypes[i] === 'u24'){
+      parsedData.push((data[j++] & 0xFF) + ((data[j++] & 0xFF) << 8) + ((data[j++] & 0xFF) << 16));
+    }
+    else if(dataTypes[i] === 'i24r'){
+      //TODO complete parsing
+      parsedData.push(((data[j++] & 0xFF) << 16) + ((data[j++] & 0xFF) << 8) + (data[j++] & 0xFF));
+    }
+  }
+  return parsedData;
+}
+
+async function sleep(msec: number) {
+    return new Promise(resolve => setTimeout(resolve, msec));
+}
